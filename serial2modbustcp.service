@@ -1,0 +1,31 @@
+[Unit]
+Description=D0/IEC 62056-21 to Modbus TCP Gateway
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=modbus
+Group=dialout
+ExecStart=/opt/serial2modbustcp/venv/bin/python /opt/serial2modbustcp/serial2modbustcp.py -c /etc/serial2modbustcp/config.json
+WorkingDirectory=/opt/serial2modbustcp
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=serial2modbustcp
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/serial2modbustcp
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+
+[Install]
+WantedBy=multi-user.target

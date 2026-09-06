@@ -1,0 +1,20 @@
+{
+  "serial_port": "/dev/ttyUSB0",
+  "serial_baudrate": 300,
+  "modbus_host": "0.0.0.0",
+  "modbus_port": 502,
+  "read_interval": 10,
+  "obis_mapping": {
+    "1-0:1.8.0": {"register": 0, "name": "Wirkenergie Bezug", "unit": "kWh", "factor": 1},
+    "1-0:2.8.0": {"register": 2, "name": "Wirkenergie Einspeisung", "unit": "kWh", "factor": 1},
+    "1-0:1.7.0": {"register": 4, "name": "Wirkleistung Bezug", "unit": "kW", "factor": 1},
+    "1-0:2.7.0": {"register": 6, "name": "Wirkleistung Einspeisung", "unit": "kW", "factor": 1},
+    "1-0:21.7.0": {"register": 8, "name": "Wirkleistung L1", "unit": "kW", "factor": 1},
+    "1-0:22.7.0": {"register": 10, "name": "Wirkleistung L1 Ein", "unit": "kW", "factor": 1},
+    "1-0:41.7.0": {"register": 12, "name": "Wirkleistung L2", "unit": "kW", "factor": 1},
+    "1-0:42.7.0": {"register": 14, "name": "Wirkleistung L2 Ein", "unit": "kW", "factor": 1},
+    "1-0:61.7.0": {"register": 16, "name": "Wirkleistung L3", "unit": "kW", "factor": 1},
+    "1-0:62.7.0": {"register": 18, "name": "Wirkleistung L3 Ein", "unit": "kW", "factor": 1}
+  },
+  "status_register": 100
+}
