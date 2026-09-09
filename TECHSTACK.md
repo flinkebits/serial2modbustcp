@@ -47,8 +47,8 @@ festgeschrieben.
 
 ## Anwendungsarchitektur
 
-Die Implementierung befindet sich vollständig in `serial2modbustcp.py` und ist
-in vier zentrale Klassen aufgeteilt:
+Die Gateway-Implementierung befindet sich in `serial2modbustcp.py` und ist in
+vier zentrale Klassen aufgeteilt:
 
 - `Config`: Laden und Zusammenführen der JSON-Konfiguration
 - `D0Parser`: serielle Verbindung, D0-Kommunikation und Telegramm-Auswertung
@@ -58,6 +58,10 @@ in vier zentrale Klassen aufgeteilt:
 Der Modbus-Server läuft in einem Hintergrund-Thread. Der Hauptthread liest in
 einer Schleife die Zählerdaten und schreibt sie in den gemeinsamen
 Modbus-Kontext.
+
+`test/modbus_live_test.py` ist ein eigenständiger Modbus-TCP-Testclient. Er
+verwendet nur die Python-Standardbibliothek und kann daher ohne das Virtual
+Environment des Gateways ausgeführt werden.
 
 ## Installation und Betrieb
 
