@@ -110,7 +110,6 @@ class D0Parser:
     """IEC 62056-21 (D0) Protokoll Parser."""
 
     IDENT_REQUEST = b"/?!\r\n"
-    ACK = bytes([0x06, 0x30, 0x30, 0x30, 0x0D, 0x0A])
 
     def __init__(self, port: str, initial_baudrate: int = 300):
         self.port = port
@@ -144,29 +143,31 @@ class D0Parser:
             return
         if self._active_baudrate == baudrate:
             return
-        self.serial_conn.close()
-        time.sleep(0.1)
-        self.serial_conn = serial.Serial(
-            port=self.port,
-            baudrate=baudrate,
-            bytesize=serial.SEVENBITS,
-            parity=serial.PARITY_EVEN,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=2,
-        )
+        # Baudrate ohne Port-Neuoeffnung (sonst gehen erste Telegramm-Bytes verloren)
+        self.serial_conn.baudrate = baudrate
         self._active_baudrate = baudrate
         logger.info("Baudrate gewechselt zu %d", baudrate)
 
     @staticmethod
-    def baudrate_from_ident(ident: str) -> int:
-        """Baudrate aus Ident-Zeile, z. B. /LGZ5\\2... -> 9600."""
+    def baud_char_from_ident(ident: str) -> str:
+        """Baud-Kennzeichen aus Ident, z. B. /LGZ5\\2... -> '5'."""
         slash = ident.find("/")
         if slash < 0:
-            return 300
+            return "0"
         after = ident[slash + 1 :]
         if len(after) < 4:
-            return 300
-        baud_char = after[3]
+            return "0"
+        return after[3]
+
+    @staticmethod
+    def build_ack(baud_char: str) -> bytes:
+        """Mode-C-Antwort: ACK + '0' + Baud-Kennung + '0' + CR LF (IEC 62056-21)."""
+        return bytes([0x06]) + b"0" + baud_char.encode("ascii") + b"0\r\n"
+
+    @staticmethod
+    def baudrate_from_ident(ident: str) -> int:
+        """Baudrate aus Ident-Zeile, z. B. /LGZ5\\2... -> 9600."""
+        baud_char = D0Parser.baud_char_from_ident(ident)
         rate = IEC62056_BAUD_RATES.get(baud_char)
         if rate is None:
             logger.warning("Unbekannte Baud-Kennung '%s' in Ident, verwende 300", baud_char)
@@ -199,7 +200,6 @@ class D0Parser:
         if data_baud != self.initial_baudrate:
             time.sleep(0.05)
             self.switch_baudrate(data_baud)
-        self.serial_conn.reset_input_buffer()
         return self.read_telegram()
 
     def identify(self) -> Optional[str]:
@@ -218,8 +218,10 @@ class D0Parser:
         try:
             ident = response.decode("ascii").strip()
             logger.info("Geraet: %s", ident)
-            self.serial_conn.write(self.ACK)
-            logger.debug("ACK gesendet")
+            baud_char = self.baud_char_from_ident(ident)
+            ack = self.build_ack(baud_char)
+            self.serial_conn.write(ack)
+            logger.debug("ACK gesendet: %r", ack)
             return ident
         except UnicodeDecodeError:
             logger.error("Ungueltige Identifikationsantwort")
@@ -242,14 +244,16 @@ class D0Parser:
         lines: List[str] = []
         start = time.time()
 
-        while time.time() - start < 5:
+        while time.time() - start < 20:
             raw = self.serial_conn.readline()
             if not raw:
                 continue
 
+            payload = raw[1:] if raw.startswith(b"\x02") else raw
             try:
-                decoded = raw.decode("ascii").strip()
+                decoded = payload.decode("ascii").strip()
             except UnicodeDecodeError:
+                logger.debug("Nicht-ASCII Zeile: %r", raw[:80])
                 continue
 
             if not decoded:
@@ -267,6 +271,8 @@ class D0Parser:
 
             lines.append(decoded)
 
+        if not lines:
+            logger.warning("Kein Datenblock empfangen (Timeout oder nur Pruefsummenfehler)")
         return "\r\n".join(lines) if lines else None
 
     def parse_values(self, telegram: str) -> Dict[str, float]:
