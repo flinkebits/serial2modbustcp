@@ -38,9 +38,9 @@ DEFAULT_OBIS_MAPPING = {
     "1-0:42.7.0": {"register": 14, "name": "Wirkleistung L2 Einspeisung", "unit": "kW", "factor": 1},
     "1-0:61.7.0": {"register": 16, "name": "Wirkleistung L3", "unit": "kW", "factor": 1},
     "1-0:62.7.0": {"register": 18, "name": "Wirkleistung L3 Einspeisung", "unit": "kW", "factor": 1},
-    "0-0:0.9.1": {"register": 20, "name": "Uhrzeit", "unit": "", "factor": 1},
-    "0-0:0.9.2": {"register": 22, "name": "Datum", "unit": "", "factor": 1},
-    "0-0:0.0.0": {"register": 24, "name": "Zaehlernummer", "unit": "", "factor": 1},
+    "0-0:0.9.1": {"register": 20, "name": "Uhrzeit", "unit": "", "factor": 1, "encoding": "hhmmss"},
+    "0-0:0.9.2": {"register": 22, "name": "Datum", "unit": "", "factor": 1, "encoding": "date"},
+    "0-0:0.0.0": {"register": 24, "name": "Zaehlernummer", "unit": "", "factor": 1, "encoding": "meter"},
     "1-0:1.8.1": {"register": 26, "name": "Wirkenergie Bezug T1", "unit": "kWh", "factor": 1},
     "1-0:1.8.2": {"register": 28, "name": "Wirkenergie Bezug T2", "unit": "kWh", "factor": 1},
     "1-0:2.8.1": {"register": 30, "name": "Wirkenergie Einspeisung T1", "unit": "kWh", "factor": 1},
@@ -72,6 +72,9 @@ DEFAULT_OBIS_MAPPING = {
     "1-0:29.7.0": {"register": 82, "name": "Scheinleistung L1", "unit": "kVA", "factor": 1},
     "1-0:49.7.0": {"register": 84, "name": "Scheinleistung L2", "unit": "kVA", "factor": 1},
     "1-0:69.7.0": {"register": 86, "name": "Scheinleistung L3", "unit": "kVA", "factor": 1},
+    "0-0:0.1.0": {"register": 88, "name": "Abrechnungsperioden", "unit": "", "factor": 1, "encoding": "integer"},
+    "1-0:C.7.0": {"register": 90, "name": "Netzausfaelle", "unit": "", "factor": 1, "encoding": "integer"},
+    "F.F": {"register": 92, "name": "Fehlerflags", "unit": "", "factor": 1, "encoding": "integer"},
 }
 
 STATUS_OFFSET_CONNECTED = 0
@@ -93,6 +96,33 @@ IEC62056_BAUD_RATES = {
     "8": 57600,
     "9": 115200,
 }
+
+
+def format_obis_value(value: float, encoding: str) -> str:
+    """Anzeigeform. Das Protokoll liefert nur Zahlen, keine formatierte Uhrzeit."""
+    if encoding == "hhmmss":
+        number = int(value) % 1000000
+        return f"{number // 10000:02d}:{(number // 100) % 100:02d}:{number % 100:02d}"
+    if encoding == "date":
+        number = int(value)
+        year, month, day = number // 10000, (number // 100) % 100, number % 100
+        return f"{2000 + year:04d}-{month:02d}-{day:02d}"
+    if encoding == "meter":
+        return f"{int(value):08d}"
+    if encoding == "integer":
+        return str(int(value))
+    return f"{value:.3f}"
+
+
+def modbus_word(value: float, encoding: str, factor: float) -> int:
+    """32-Bit-Wert fuer zwei Holding-Register. Messwerte in Tausendsteln, Kennungen roh."""
+    if encoding == "date":
+        number = int(value)
+        year, month, day = number // 10000, (number // 100) % 100, number % 100
+        return (2000 + year) * 10000 + month * 100 + day
+    if encoding in ("hhmmss", "meter", "integer"):
+        return int(value * factor)
+    return int(value * factor * 1000)
 
 
 class Config:
@@ -453,12 +483,14 @@ class D0Parser:
 
         if "1-0:1.7.0" not in result and "1-0:16.7.0" in result:
             power = result["1-0:16.7.0"]
-            if power >= 0:
+            if "1-0:2.7.0" in result:
+                result["1-0:1.7.0"] = power + result["1-0:2.7.0"]
+            elif power >= 0:
                 result["1-0:1.7.0"] = power
-                result.setdefault("1-0:2.7.0", 0.0)
+                result["1-0:2.7.0"] = 0.0
             else:
                 result["1-0:1.7.0"] = 0.0
-                result.setdefault("1-0:2.7.0", -power)
+                result["1-0:2.7.0"] = -power
         elif "1-0:1.7.0" not in result and "1-0:1.4.0" in result:
             result["1-0:1.7.0"] = result["1-0:1.4.0"]
 
@@ -500,11 +532,17 @@ class ModbusInterface:
         cfg = mapping[obis_code]
         addr = cfg["register"]
         factor = cfg.get("factor", 1)
-        int_val = int(value * factor * 1000)
+        int_val = modbus_word(value, cfg.get("encoding", "scaled"), factor)
+        int_val &= 0xFFFFFFFF
         high = (int_val >> 16) & 0xFFFF
         low = int_val & 0xFFFF
         self.write_holding(addr, [high, low])
-        logger.debug("Register %d: %s = %.3f", addr, obis_code, value)
+        logger.debug(
+            "Register %d: %s = %s",
+            addr,
+            obis_code,
+            format_obis_value(value, cfg.get("encoding", "scaled")),
+        )
 
     def update_status(
         self,
@@ -619,7 +657,8 @@ class Gateway:
         )
         for obis_code, mapping in entries:
             value = values.get(obis_code)
-            formatted_value = f"{value:.3f}" if value is not None else "n/a"
+            encoding = str(mapping.get("encoding", "scaled"))
+            formatted_value = format_obis_value(value, encoding) if value is not None else "n/a"
             name = str(mapping.get("name", ""))
             unit = str(mapping.get("unit", ""))
             register = mapping["register"]
