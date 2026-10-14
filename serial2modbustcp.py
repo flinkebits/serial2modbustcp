@@ -41,6 +41,37 @@ DEFAULT_OBIS_MAPPING = {
     "0-0:0.9.1": {"register": 20, "name": "Uhrzeit", "unit": "", "factor": 1},
     "0-0:0.9.2": {"register": 22, "name": "Datum", "unit": "", "factor": 1},
     "0-0:0.0.0": {"register": 24, "name": "Zaehlernummer", "unit": "", "factor": 1},
+    "1-0:1.8.1": {"register": 26, "name": "Wirkenergie Bezug T1", "unit": "kWh", "factor": 1},
+    "1-0:1.8.2": {"register": 28, "name": "Wirkenergie Bezug T2", "unit": "kWh", "factor": 1},
+    "1-0:2.8.1": {"register": 30, "name": "Wirkenergie Einspeisung T1", "unit": "kWh", "factor": 1},
+    "1-0:2.8.2": {"register": 32, "name": "Wirkenergie Einspeisung T2", "unit": "kWh", "factor": 1},
+    "1-0:3.8.0": {"register": 34, "name": "Blindenergie Bezug", "unit": "kvarh", "factor": 1},
+    "1-0:4.8.0": {"register": 36, "name": "Blindenergie Einspeisung", "unit": "kvarh", "factor": 1},
+    "1-0:5.8.0": {"register": 38, "name": "Blindenergie QI", "unit": "kvarh", "factor": 1},
+    "1-0:6.8.0": {"register": 40, "name": "Blindenergie QII", "unit": "kvarh", "factor": 1},
+    "1-0:7.8.0": {"register": 42, "name": "Blindenergie QIII", "unit": "kvarh", "factor": 1},
+    "1-0:8.8.0": {"register": 44, "name": "Blindenergie QIV", "unit": "kvarh", "factor": 1},
+    "1-0:9.8.0": {"register": 46, "name": "Scheinenergie", "unit": "kVAh", "factor": 1},
+    "1-0:3.7.0": {"register": 48, "name": "Blindleistung Bezug", "unit": "kvar", "factor": 1},
+    "1-0:4.7.0": {"register": 50, "name": "Blindleistung Einspeisung", "unit": "kvar", "factor": 1},
+    "1-0:9.7.0": {"register": 52, "name": "Scheinleistung", "unit": "kVA", "factor": 1},
+    "1-0:1.4.0": {"register": 54, "name": "Wirkleistung Mittel", "unit": "kW", "factor": 1},
+    "1-0:1.5.0": {"register": 56, "name": "Wirkleistung Vorperiode", "unit": "kW", "factor": 1},
+    "1-0:16.7.0": {"register": 58, "name": "Wirkleistung saldiert", "unit": "kW", "factor": 1},
+    "1-0:1.6.1": {"register": 60, "name": "Max Wirkleistung T1", "unit": "kW", "factor": 1},
+    "1-0:1.6.2": {"register": 62, "name": "Max Wirkleistung T2", "unit": "kW", "factor": 1},
+    "1-0:2.6.1": {"register": 64, "name": "Max Wirkleistung Ein T1", "unit": "kW", "factor": 1},
+    "1-0:2.6.2": {"register": 66, "name": "Max Wirkleistung Ein T2", "unit": "kW", "factor": 1},
+    "1-0:1.2.1": {"register": 68, "name": "Kum Maximum Bezug T1", "unit": "kW", "factor": 1},
+    "1-0:1.2.2": {"register": 70, "name": "Kum Maximum Bezug T2", "unit": "kW", "factor": 1},
+    "1-0:2.2.1": {"register": 72, "name": "Kum Maximum Ein T1", "unit": "kW", "factor": 1},
+    "1-0:2.2.2": {"register": 74, "name": "Kum Maximum Ein T2", "unit": "kW", "factor": 1},
+    "1-0:23.7.0": {"register": 76, "name": "Blindleistung L1", "unit": "kvar", "factor": 1},
+    "1-0:43.7.0": {"register": 78, "name": "Blindleistung L2", "unit": "kvar", "factor": 1},
+    "1-0:63.7.0": {"register": 80, "name": "Blindleistung L3", "unit": "kvar", "factor": 1},
+    "1-0:29.7.0": {"register": 82, "name": "Scheinleistung L1", "unit": "kVA", "factor": 1},
+    "1-0:49.7.0": {"register": 84, "name": "Scheinleistung L2", "unit": "kVA", "factor": 1},
+    "1-0:69.7.0": {"register": 86, "name": "Scheinleistung L3", "unit": "kVA", "factor": 1},
 }
 
 STATUS_OFFSET_CONNECTED = 0
@@ -376,6 +407,14 @@ class D0Parser:
             logger.warning("Kein Datenblock bei %d Baud (Timeout)", self._active_baudrate)
         return "\r\n".join(lines) if lines else None
 
+    @staticmethod
+    def _is_current_value(raw_code: str) -> bool:
+        """Historische Abrechnungsperioden *01..*99 verwerfen, *255 behalten."""
+        if "*" not in raw_code:
+            return True
+        storage = raw_code.split("*", 1)[1].strip()
+        return storage == "255"
+
     def parse_values(self, telegram: str) -> Dict[str, float]:
         result: Dict[str, float] = {}
         for line in telegram.split("\r\n"):
@@ -383,15 +422,45 @@ class D0Parser:
                 continue
             try:
                 obis_end = line.index("(")
-                obis_code = self.normalize_obis_code(line[:obis_end])
+                raw_code = line[:obis_end].strip()
+                if not self._is_current_value(raw_code):
+                    continue
+                obis_code = self.normalize_obis_code(raw_code)
                 value_end = line.index(")", obis_end + 1)
-                value_str = line[obis_end + 1 : value_end]
+                value_str = line[obis_end + 1 : value_end].replace(",", ".").strip()
                 if "*" in value_str:
-                    value_str = value_str.split("*")[0]
+                    value_str = value_str.split("*", 1)[0].strip()
                 result[obis_code] = float(value_str)
             except (ValueError, IndexError):
+                if any(unit in line for unit in ("kW", "kVA", "kvar")):
+                    logger.debug("Messwert nicht geparst: %s", line[:120])
                 continue
+        self._fill_missing_totals(result)
         return result
+
+    @staticmethod
+    def _fill_missing_totals(result: Dict[str, float]) -> None:
+        """Tarifsummen und saldierte Leistung in die Summenregister legen."""
+        for total, parts in (
+            ("1-0:1.8.0", ("1-0:1.8.1", "1-0:1.8.2")),
+            ("1-0:2.8.0", ("1-0:2.8.1", "1-0:2.8.2")),
+        ):
+            if total in result:
+                continue
+            present = [result[part] for part in parts if part in result]
+            if present:
+                result[total] = sum(present)
+
+        if "1-0:1.7.0" not in result and "1-0:16.7.0" in result:
+            power = result["1-0:16.7.0"]
+            if power >= 0:
+                result["1-0:1.7.0"] = power
+                result.setdefault("1-0:2.7.0", 0.0)
+            else:
+                result["1-0:1.7.0"] = 0.0
+                result.setdefault("1-0:2.7.0", -power)
+        elif "1-0:1.7.0" not in result and "1-0:1.4.0" in result:
+            result["1-0:1.7.0"] = result["1-0:1.4.0"]
 
 
 class ModbusInterface:
