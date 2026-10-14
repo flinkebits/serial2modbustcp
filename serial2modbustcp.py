@@ -41,10 +41,11 @@ DEFAULT_OBIS_MAPPING = {
     "0-0:1.0.0": {"register": 20, "name": "Zeitstempel", "unit": "", "factor": 1},
 }
 
-STATUS_REGISTER_CONNECTED = 0
-STATUS_REGISTER_ERRORS = 1
-STATUS_REGISTER_LAST_READ = 2
-STATUS_REGISTER_VERSION = 3
+STATUS_OFFSET_CONNECTED = 0
+STATUS_OFFSET_ERRORS = 1
+STATUS_OFFSET_LAST_READ = 2
+STATUS_OFFSET_VERSION = 3
+STATUS_REGISTER_COUNT = 4
 
 # IEC 62056-21 Baudraten-Kennung (Zeichen nach Herstellerkennung in der Ident-Zeile)
 IEC62056_BAUD_RATES = {
@@ -71,6 +72,7 @@ class Config:
         "modbus_port": 502,
         "read_interval": 10,
         "obis_mapping": DEFAULT_OBIS_MAPPING,
+        "status_register": 100,
     }
 
     def __init__(self, config_path: Optional[str] = None):
@@ -328,32 +330,56 @@ class ModbusInterface:
         self.write_holding(addr, [high, low])
         logger.debug("Register %d: %s = %.3f", addr, obis_code, value)
 
-    def update_status(self, connected: bool, errors: int, last_read: int, version: str) -> None:
+    def update_status(
+        self,
+        base_address: int,
+        connected: bool,
+        errors: int,
+        last_read: int,
+        version: str,
+    ) -> None:
         status_word = 1 if connected else 0
-        self.write_holding(STATUS_REGISTER_CONNECTED, [status_word])
-        self.write_holding(STATUS_REGISTER_ERRORS, [errors & 0xFFFF])
-        self.write_holding(STATUS_REGISTER_LAST_READ, [last_read & 0xFFFF])
+        self.write_holding(base_address + STATUS_OFFSET_CONNECTED, [status_word])
+        self.write_holding(base_address + STATUS_OFFSET_ERRORS, [errors & 0xFFFF])
+        self.write_holding(base_address + STATUS_OFFSET_LAST_READ, [last_read & 0xFFFF])
         ver_int = int(version.replace(".", "")[:4].ljust(4, "0"))
-        self.write_holding(STATUS_REGISTER_VERSION, [ver_int])
+        self.write_holding(base_address + STATUS_OFFSET_VERSION, [ver_int])
 
 
 class Gateway:
     """Haupt-Gateway Klasse."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, print_values: bool = False):
         self.config = config
         self.d0 = D0Parser(config.serial_port, config.serial_baudrate)
         self.modbus = ModbusInterface(config.modbus_host, config.modbus_port)
+        self.print_values = print_values
         self._running = False
 
     def start(self) -> None:
         logger.info("serial2modbustcp Gateway gestartet (v%s)", __version__)
 
+        status_register = int(self.config.status_register)
+        if not 0 <= status_register <= 0xFFFF - STATUS_REGISTER_COUNT + 1:
+            raise ValueError("status_register liegt ausserhalb des Modbus-Adressraums")
+
+        status_addresses = set(
+            range(status_register, status_register + STATUS_REGISTER_COUNT),
+        )
+        for obis_code, mapping in self.config.obis_mapping.items():
+            address = int(mapping["register"])
+            if status_addresses.intersection((address, address + 1)):
+                raise ValueError(
+                    f"Statusregister ueberlappt OBIS-Mapping {obis_code}",
+                )
+
         max_reg = max(
             (m["register"] + 2 for m in self.config.obis_mapping.values()),
             default=20,
         )
-        self.modbus.initialize(max(max_reg, STATUS_REGISTER_VERSION + 1))
+        max_reg = max(max_reg, status_register + STATUS_REGISTER_COUNT)
+        # ModbusSlaveContext verwendet standardmaessig eine Adressoffsetschicht.
+        self.modbus.initialize(max_reg + 1)
         self.modbus.start_server()
 
         try:
@@ -369,6 +395,7 @@ class Gateway:
         last_read_ts = 0
 
         while self._running:
+            values: Dict[str, float] = {}
             try:
                 telegram = self.d0.read_cycle()
                 if telegram:
@@ -382,7 +409,11 @@ class Gateway:
                 error_count += 1
                 logger.error("Lesefehler: %s", e)
 
+            if self.print_values:
+                self._print_values(values)
+
             self.modbus.update_status(
+                base_address=int(self.config.status_register),
                 connected=self.d0.is_connected,
                 errors=error_count,
                 last_read=last_read_ts,
@@ -390,6 +421,40 @@ class Gateway:
             )
 
             time.sleep(self.config.read_interval)
+
+    def _print_values(self, values: Dict[str, float]) -> None:
+        """Konfigurierte und zusaetzlich ermittelte Werte auf stdout ausgeben."""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n[{timestamp}] Ermittelte Zaehlerwerte")
+        print("-" * 100)
+        print(
+            f"{'OBIS':<18} {'Name':<34} {'Wert':>14} "
+            f"{'Einheit':<10} {'Register':>8}",
+        )
+
+        configured_codes = set(self.config.obis_mapping)
+        entries = sorted(
+            self.config.obis_mapping.items(),
+            key=lambda entry: entry[1]["register"],
+        )
+        for obis_code, mapping in entries:
+            value = values.get(obis_code)
+            formatted_value = f"{value:.3f}" if value is not None else "n/a"
+            name = str(mapping.get("name", ""))
+            unit = str(mapping.get("unit", ""))
+            register = mapping["register"]
+            print(
+                f"{obis_code:<18} {name:<34.34} {formatted_value:>14} "
+                f"{unit:<10.10} {register:>8}",
+            )
+
+        additional_values = sorted(set(values) - configured_codes)
+        if additional_values:
+            print("\nWeitere ermittelte, nicht konfigurierte OBIS-Werte:")
+            for obis_code in additional_values:
+                print(f"  {obis_code:<18} {values[obis_code]:.3f}")
+
+        sys.stdout.flush()
 
     def stop(self) -> None:
         self._running = False
@@ -408,10 +473,30 @@ def main() -> None:
         default="/etc/serial2modbustcp/config.json",
         help="Konfigurationsdatei (default: /etc/serial2modbustcp/config.json)",
     )
-    parser.add_argument("-p", "--port", default="/dev/ttyUSB0", help="Serieller Port")
-    parser.add_argument("-H", "--modbus-host", default="0.0.0.0", help="Modbus TCP Host")
-    parser.add_argument("-P", "--modbus-port", type=int, default=502, help="Modbus TCP Port")
-    parser.add_argument("-i", "--interval", type=int, default=10, help="Lese-Intervall (Sekunden)")
+    parser.add_argument("-p", "--port", help="Serieller Port (ueberschreibt Config)")
+    parser.add_argument(
+        "-H",
+        "--modbus-host",
+        help="Modbus TCP Host (ueberschreibt Config)",
+    )
+    parser.add_argument(
+        "-P",
+        "--modbus-port",
+        type=int,
+        help="Modbus TCP Port (ueberschreibt Config)",
+    )
+    parser.add_argument(
+        "-i",
+        "--interval",
+        type=int,
+        help="Lese-Intervall in Sekunden (ueberschreibt Config)",
+    )
+    parser.add_argument(
+        "-v",
+        "--values",
+        action="store_true",
+        help="Konfigurierte und ermittelte Werte auf stdout ausgeben",
+    )
     parser.add_argument("-d", "--debug", action="store_true", help="Debug-Logging aktivieren")
 
     args = parser.parse_args()
@@ -424,12 +509,16 @@ def main() -> None:
     )
 
     config = Config(args.config)
-    config._data["serial_port"] = args.port
-    config._data["modbus_host"] = args.modbus_host
-    config._data["modbus_port"] = args.modbus_port
-    config._data["read_interval"] = args.interval
+    if args.port is not None:
+        config._data["serial_port"] = args.port
+    if args.modbus_host is not None:
+        config._data["modbus_host"] = args.modbus_host
+    if args.modbus_port is not None:
+        config._data["modbus_port"] = args.modbus_port
+    if args.interval is not None:
+        config._data["read_interval"] = args.interval
 
-    gateway = Gateway(config)
+    gateway = Gateway(config, print_values=args.values)
     try:
         gateway.start()
     except KeyboardInterrupt:
