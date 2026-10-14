@@ -163,23 +163,6 @@ class D0Parser:
         logger.info("Baudrate gewechselt zu %d", baudrate)
 
     @staticmethod
-    def manufacturer_from_ident(ident: str) -> str:
-        if not ident.startswith("/") or len(ident) < 4:
-            return ""
-        return ident[1:4].upper()
-
-    def resolve_use_baud_switch(self, ident: str) -> bool:
-        setting = self.use_baud_switch
-        if setting is True or setting is False:
-            return bool(setting)
-        if isinstance(setting, str) and setting.lower() in ("0", "false", "no", "off"):
-            return False
-        if isinstance(setting, str) and setting.lower() in ("1", "true", "yes", "on"):
-            return True
-        # auto: Landis+Gyr liefert Daten oft weiter bei 300 Baud (siehe iec62056-21/LGZ-Issues)
-        return self.manufacturer_from_ident(ident) != "LGZ"
-
-    @staticmethod
     def normalize_ident_line(line: str) -> Optional[str]:
         """Ident ab '/' extrahieren (Prefix wie T/ oder V/ vor /LGZ5...)."""
         slash = line.find("/")
@@ -234,44 +217,69 @@ class D0Parser:
             obis_code = f"1-0:{obis_code}"
         return obis_code
 
+    def _listen_plans(self, ident: str) -> List[tuple]:
+        """(ACK-Baudzeichen, Lese-Baudrate). ACK und Leser muessen dieselbe Rate nutzen."""
+        proposed_char = self.baud_char_from_ident(ident)
+        proposed_baud = self.baudrate_from_ident(ident)
+        stay = ("0", self.initial_baudrate)
+        switched = (proposed_char, proposed_baud)
+        mode = self.use_baud_switch
+        mode_l = mode.lower() if isinstance(mode, str) else mode
+        if mode is True or mode_l in ("1", "true", "yes", "on"):
+            return [switched]
+        if mode is False or mode_l in ("0", "false", "no", "off"):
+            return [stay]
+        plans = [stay]
+        if switched[1] != stay[1]:
+            plans.append(switched)
+        return plans
+
+    def _prepare_initial_baud(self) -> None:
+        if not self.serial_conn:
+            return
+        if self._active_baudrate != self.initial_baudrate:
+            self.switch_baudrate(self.initial_baudrate)
+        self.serial_conn.reset_input_buffer()
+        time.sleep(0.3)
+
     def read_cycle(self) -> Optional[str]:
-        """Vollstaendiger D0-Lesezyklus: IDENT @ 300, ACK, Baudwechsel, Telegramm."""
+        """IDENT @ 300, dann ACK passend zur Lese-Baudrate. Bei Misserfolg der andere Modus."""
         if not self.serial_conn:
             return None
 
-        if self._active_baudrate != self.initial_baudrate:
-            self.switch_baudrate(self.initial_baudrate)
-            self.serial_conn.reset_input_buffer()
-            time.sleep(0.3)
+        plans: Optional[List[tuple]] = None
+        for attempt in range(3):
+            self._prepare_initial_baud()
+            ident = self.identify()
+            if not ident:
+                time.sleep(0.4)
+                continue
+            if plans is None:
+                plans = self._listen_plans(ident)
+            if not plans:
+                break
 
-        ident = self.identify()
-        if not ident:
-            return None
-
-        data_baud = self.baudrate_from_ident(ident)
-        use_switch = self.resolve_use_baud_switch(ident)
-        if use_switch and data_baud != self.initial_baudrate:
-            listen_baud = data_baud
-            baud_char = self.baud_char_from_ident(ident)
-            logger.info("Daten-Baudrate laut Ident: %d (Baudwechsel aktiv)", data_baud)
-        else:
-            listen_baud = self.initial_baudrate
-            baud_char = "0"
+            baud_char, listen_baud = plans.pop(0)
+            ack = self.build_ack(baud_char)
             logger.info(
-                "Daten-Baudrate laut Ident: %d, ACK fordert %d Baud",
-                data_baud,
+                "Leseversuch %d: ACK %r, lesen bei %d Baud",
+                attempt + 1,
+                ack,
                 listen_baud,
             )
+            self.serial_conn.write(ack)
+            self.serial_conn.flush()
+            time.sleep(0.2)
+            if listen_baud != self._active_baudrate:
+                self.switch_baudrate(listen_baud)
 
-        ack = self.build_ack(baud_char)
-        self.serial_conn.write(ack)
-        self.serial_conn.flush()
-        logger.debug("ACK gesendet: %r", ack)
-        # Zaehler schaltet ca. 200 ms nach ACK; erst dann die eigene Baudrate aendern.
-        time.sleep(0.2)
-        if listen_baud != self._active_baudrate:
-            self.switch_baudrate(listen_baud)
-        return self.read_telegram()
+            telegram = self.read_telegram()
+            if telegram:
+                return telegram
+            logger.warning("Kein OBIS-Block bei %d Baud", listen_baud)
+            if not plans:
+                break
+        return None
 
     def identify(self) -> Optional[str]:
         if not self.serial_conn:
@@ -308,49 +316,61 @@ class D0Parser:
         logger.warning("Keine gueltige Identifikationsantwort innerhalb 3s")
         return None
 
+    @staticmethod
+    def _is_binary_frame(raw: bytes) -> bool:
+        """Steuerzeichen ausser STX/ETX/CR/LF heissen: falsche Baudrate."""
+        return any(b < 32 and b not in (0x02, 0x03, 0x0D, 0x0A) for b in raw)
+
     def read_telegram(self) -> Optional[str]:
         if not self.serial_conn:
             return None
 
         lines: List[str] = []
         start = time.time()
+        last_data = start
 
-        idle_reads = 0
-        while time.time() - start < 20:
+        while time.time() - start < 12:
             raw = self.serial_conn.readline()
             if not raw:
-                idle_reads += 1
-                if idle_reads == 1:
-                    logger.debug("Warte auf Datenblock...")
+                if lines and time.time() - last_data > 1.5:
+                    break
                 continue
-            idle_reads = 0
+
+            last_data = time.time()
             logger.debug("Rohzeile: %r", raw[:100])
+            if self._is_binary_frame(raw):
+                if not lines:
+                    logger.warning(
+                        "Binaerdaten bei %d Baud, Versuch abgebrochen",
+                        self._active_baudrate,
+                    )
+                    return None
+                continue
 
             payload = raw[1:] if raw.startswith(b"\x02") else raw
+            if payload.endswith(b"\x03"):
+                payload = payload[:-1]
             try:
                 decoded = payload.decode("ascii").strip()
             except UnicodeDecodeError:
-                logger.debug("Nicht-ASCII Zeile: %r", raw[:80])
+                if not lines:
+                    logger.warning(
+                        "Nicht-ASCII bei %d Baud, Versuch abgebrochen",
+                        self._active_baudrate,
+                    )
+                    return None
                 continue
 
-            if not decoded:
+            if not decoded or decoded.startswith("/"):
                 continue
-
             if decoded.startswith("!"):
                 break
-
-            if decoded.startswith("/"):
+            if "(" not in decoded:
                 continue
-
-            # IEC 62056-21 hat eine BCC nur am Blockende (nach ETX), nicht pro Zeile.
-            if "(" not in decoded and not decoded.startswith("!"):
-                logger.debug("Keine Datenzeile: %s", decoded[:80])
-                continue
-
             lines.append(decoded)
 
         if not lines:
-            logger.warning("Kein Datenblock empfangen (Timeout)")
+            logger.warning("Kein Datenblock bei %d Baud (Timeout)", self._active_baudrate)
         return "\r\n".join(lines) if lines else None
 
     def parse_values(self, telegram: str) -> Dict[str, float]:
