@@ -1,7 +1,7 @@
 {
   "serial_port": "/dev/ttyUSB0",
   "serial_baudrate": 300,
-  "serial_use_baud_switch": "auto",
+  "serial_use_baud_switch": false,
   "modbus_host": "0.0.0.0",
   "modbus_port": 502,
   "read_interval": 10,
@@ -15,7 +15,10 @@
     "1-0:41.7.0": {"register": 12, "name": "Wirkleistung L2", "unit": "kW", "factor": 1},
     "1-0:42.7.0": {"register": 14, "name": "Wirkleistung L2 Ein", "unit": "kW", "factor": 1},
     "1-0:61.7.0": {"register": 16, "name": "Wirkleistung L3", "unit": "kW", "factor": 1},
-    "1-0:62.7.0": {"register": 18, "name": "Wirkleistung L3 Ein", "unit": "kW", "factor": 1}
+    "1-0:62.7.0": {"register": 18, "name": "Wirkleistung L3 Ein", "unit": "kW", "factor": 1},
+    "0-0:0.9.1": {"register": 20, "name": "Uhrzeit", "unit": "", "factor": 1},
+    "0-0:0.9.2": {"register": 22, "name": "Datum", "unit": "", "factor": 1},
+    "0-0:0.0.0": {"register": 24, "name": "Zaehlernummer", "unit": "", "factor": 1}
   },
   "status_register": 100
 }

@@ -38,7 +38,9 @@ DEFAULT_OBIS_MAPPING = {
     "1-0:42.7.0": {"register": 14, "name": "Wirkleistung L2 Einspeisung", "unit": "kW", "factor": 1},
     "1-0:61.7.0": {"register": 16, "name": "Wirkleistung L3", "unit": "kW", "factor": 1},
     "1-0:62.7.0": {"register": 18, "name": "Wirkleistung L3 Einspeisung", "unit": "kW", "factor": 1},
-    "0-0:1.0.0": {"register": 20, "name": "Zeitstempel", "unit": "", "factor": 1},
+    "0-0:0.9.1": {"register": 20, "name": "Uhrzeit", "unit": "", "factor": 1},
+    "0-0:0.9.2": {"register": 22, "name": "Datum", "unit": "", "factor": 1},
+    "0-0:0.0.0": {"register": 24, "name": "Zaehlernummer", "unit": "", "factor": 1},
 }
 
 STATUS_OFFSET_CONNECTED = 0
@@ -210,11 +212,12 @@ class D0Parser:
 
     @staticmethod
     def normalize_obis_code(obis_code: str) -> str:
-        """OBIS vereinheitlichen: Speicher *255 entfernen, Kurzform 1.8.0 -> 1-0:1.8.0."""
+        """OBIS vereinheitlichen: *255 abtrennen, 1.8.0 -> 1-0:1.8.0, 0.9.1 -> 0-0:0.9.1."""
         if "*" in obis_code:
             obis_code = obis_code.split("*", 1)[0]
         if "-" not in obis_code and obis_code.count(".") >= 2:
-            obis_code = f"1-0:{obis_code}"
+            medium = "0-0" if obis_code.startswith("0.") else "1-0"
+            obis_code = f"{medium}:{obis_code}"
         return obis_code
 
     def _listen_plans(self, ident: str) -> List[tuple]:
@@ -329,10 +332,10 @@ class D0Parser:
         start = time.time()
         last_data = start
 
-        while time.time() - start < 12:
+        while time.time() - start < 240:
             raw = self.serial_conn.readline()
             if not raw:
-                if lines and time.time() - last_data > 1.5:
+                if lines and time.time() - last_data > 6:
                     break
                 continue
 
