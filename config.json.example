@@ -1,6 +1,7 @@
 {
   "serial_port": "/dev/ttyUSB0",
   "serial_baudrate": 300,
+  "serial_use_baud_switch": "auto",
   "modbus_host": "0.0.0.0",
   "modbus_port": 502,
   "read_interval": 10,

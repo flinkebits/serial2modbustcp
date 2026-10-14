@@ -73,6 +73,8 @@ class Config:
         "read_interval": 10,
         "obis_mapping": DEFAULT_OBIS_MAPPING,
         "status_register": 100,
+        # "auto" | true | false — viele Landis+Gyr senden trotz LGZ5 bei 300 Baud
+        "serial_use_baud_switch": "auto",
     }
 
     def __init__(self, config_path: Optional[str] = None):
@@ -111,21 +113,20 @@ class D0Parser:
 
     IDENT_REQUEST = b"/?!\r\n"
 
-    def __init__(self, port: str, initial_baudrate: int = 300):
+    def __init__(
+        self,
+        port: str,
+        initial_baudrate: int = 300,
+        use_baud_switch: str = "auto",
+    ):
         self.port = port
         self.initial_baudrate = initial_baudrate
+        self.use_baud_switch = use_baud_switch
         self.serial_conn: Optional[serial.Serial] = None
         self._active_baudrate = initial_baudrate
 
     def connect(self) -> None:
-        self.serial_conn = serial.Serial(
-            port=self.port,
-            baudrate=self.initial_baudrate,
-            bytesize=serial.SEVENBITS,
-            parity=serial.PARITY_EVEN,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=2,
-        )
+        self.serial_conn = self._open_serial(self.initial_baudrate)
         self._active_baudrate = self.initial_baudrate
         logger.info("Verbunden mit %s @ %d baud", self.port, self.initial_baudrate)
 
@@ -138,15 +139,45 @@ class D0Parser:
     def is_connected(self) -> bool:
         return self.serial_conn is not None and self.serial_conn.is_open
 
+    def _open_serial(self, baudrate: int) -> serial.Serial:
+        return serial.Serial(
+            port=self.port,
+            baudrate=baudrate,
+            bytesize=serial.SEVENBITS,
+            parity=serial.PARITY_EVEN,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=2,
+        )
+
     def switch_baudrate(self, baudrate: int) -> None:
         if not self.serial_conn:
             return
         if self._active_baudrate == baudrate:
             return
-        # Baudrate ohne Port-Neuoeffnung (sonst gehen erste Telegramm-Bytes verloren)
-        self.serial_conn.baudrate = baudrate
+        timeout = self.serial_conn.timeout
+        self.serial_conn.close()
+        time.sleep(0.05)
+        self.serial_conn = self._open_serial(baudrate)
+        self.serial_conn.timeout = timeout
         self._active_baudrate = baudrate
         logger.info("Baudrate gewechselt zu %d", baudrate)
+
+    @staticmethod
+    def manufacturer_from_ident(ident: str) -> str:
+        if not ident.startswith("/") or len(ident) < 4:
+            return ""
+        return ident[1:4].upper()
+
+    def resolve_use_baud_switch(self, ident: str) -> bool:
+        setting = self.use_baud_switch
+        if setting is True or setting is False:
+            return bool(setting)
+        if isinstance(setting, str) and setting.lower() in ("0", "false", "no", "off"):
+            return False
+        if isinstance(setting, str) and setting.lower() in ("1", "true", "yes", "on"):
+            return True
+        # auto: Landis+Gyr liefert Daten oft weiter bei 300 Baud (siehe iec62056-21/LGZ-Issues)
+        return self.manufacturer_from_ident(ident) != "LGZ"
 
     @staticmethod
     def normalize_ident_line(line: str) -> Optional[str]:
@@ -182,7 +213,7 @@ class D0Parser:
     @staticmethod
     def build_ack(baud_char: str) -> bytes:
         """Mode-C-Antwort: ACK + '0' + Baud-Kennung + '0' + CR LF (IEC 62056-21)."""
-        return bytes([0x06]) + b"0" + baud_char.encode("ascii") + b"0\r\n"
+        return bytes([0x06, 0x30, ord(baud_char), 0x30, 0x0D, 0x0A])
 
     @staticmethod
     def baudrate_from_ident(ident: str) -> int:
@@ -218,9 +249,18 @@ class D0Parser:
             return None
 
         data_baud = self.baudrate_from_ident(ident)
-        logger.info("Daten-Baudrate laut Ident: %d", data_baud)
-        if data_baud != self.initial_baudrate:
-            time.sleep(0.05)
+        use_switch = self.resolve_use_baud_switch(ident)
+        if use_switch:
+            logger.info("Daten-Baudrate laut Ident: %d (Baudwechsel aktiv)", data_baud)
+        else:
+            logger.info(
+                "Daten-Baudrate laut Ident: %d, lese bei %d (Baudwechsel aus)",
+                data_baud,
+                self.initial_baudrate,
+            )
+        # IEC 62056-21: nach ACK warten, dann ggf. Baudrate wechseln
+        time.sleep(0.3)
+        if use_switch and data_baud != self.initial_baudrate:
             self.switch_baudrate(data_baud)
         return self.read_telegram()
 
@@ -272,7 +312,8 @@ class D0Parser:
         calculated = 0
         for b in data:
             calculated ^= b
-        return calculated == checksum_byte
+        calculated &= 0x7F
+        return calculated == (checksum_byte & 0x7F)
 
     def read_telegram(self) -> Optional[str]:
         if not self.serial_conn:
@@ -281,10 +322,16 @@ class D0Parser:
         lines: List[str] = []
         start = time.time()
 
+        idle_reads = 0
         while time.time() - start < 20:
             raw = self.serial_conn.readline()
             if not raw:
+                idle_reads += 1
+                if idle_reads == 1:
+                    logger.debug("Warte auf Datenblock...")
                 continue
+            idle_reads = 0
+            logger.debug("Rohzeile: %r", raw[:100])
 
             payload = raw[1:] if raw.startswith(b"\x02") else raw
             try:
@@ -394,7 +441,11 @@ class Gateway:
 
     def __init__(self, config: Config, print_values: bool = False):
         self.config = config
-        self.d0 = D0Parser(config.serial_port, config.serial_baudrate)
+        self.d0 = D0Parser(
+            config.serial_port,
+            config.serial_baudrate,
+            use_baud_switch=config.serial_use_baud_switch,
+        )
         self.modbus = ModbusInterface(config.modbus_host, config.modbus_port)
         self.print_values = print_values
         self._running = False
