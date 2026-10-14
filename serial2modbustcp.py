@@ -149,6 +149,26 @@ class D0Parser:
         logger.info("Baudrate gewechselt zu %d", baudrate)
 
     @staticmethod
+    def normalize_ident_line(line: str) -> Optional[str]:
+        """Ident ab '/' extrahieren (Prefix wie T/ oder V/ vor /LGZ5...)."""
+        slash = line.find("/")
+        if slash < 0:
+            return None
+        return line[slash:].strip()
+
+    @staticmethod
+    def is_valid_ident_line(ident: str) -> bool:
+        """Pruefen ob Zeile eine IEC-62056-21-Identifikation ist, keine OBIS-Datenzeile."""
+        if not ident.startswith("/"):
+            return False
+        after = ident[1:]
+        if len(after) < 4:
+            return False
+        if not after[:3].isalpha():
+            return False
+        return after[3] in IEC62056_BAUD_RATES
+
+    @staticmethod
     def baud_char_from_ident(ident: str) -> str:
         """Baud-Kennzeichen aus Ident, z. B. /LGZ5\\2... -> '5'."""
         slash = ident.find("/")
@@ -190,6 +210,8 @@ class D0Parser:
 
         if self._active_baudrate != self.initial_baudrate:
             self.switch_baudrate(self.initial_baudrate)
+            self.serial_conn.reset_input_buffer()
+            time.sleep(0.3)
 
         ident = self.identify()
         if not ident:
@@ -206,26 +228,41 @@ class D0Parser:
         if not self.serial_conn:
             return None
         self.serial_conn.reset_input_buffer()
+        time.sleep(0.3)
         self.serial_conn.write(self.IDENT_REQUEST)
+        self.serial_conn.flush()
         logger.debug("Identifikationsanfrage gesendet")
 
-        time.sleep(0.2)
-        response = self.serial_conn.readline()
-        if not response:
-            logger.warning("Keine Identifikationsantwort")
-            return None
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            response = self.serial_conn.readline()
+            if not response:
+                continue
+            try:
+                line = response.decode("ascii").strip()
+            except UnicodeDecodeError:
+                logger.debug("Ident-Zeile nicht ASCII: %r", response[:80])
+                continue
+            if not line:
+                continue
 
-        try:
-            ident = response.decode("ascii").strip()
+            ident = self.normalize_ident_line(line)
+            if ident is None or not self.is_valid_ident_line(ident):
+                logger.debug("Uebersprungen (keine Ident): %s", line[:80])
+                continue
+
             logger.info("Geraet: %s", ident)
+            if line != ident:
+                logger.debug("Ident normalisiert von: %s", line[:80])
             baud_char = self.baud_char_from_ident(ident)
             ack = self.build_ack(baud_char)
             self.serial_conn.write(ack)
+            self.serial_conn.flush()
             logger.debug("ACK gesendet: %r", ack)
             return ident
-        except UnicodeDecodeError:
-            logger.error("Ungueltige Identifikationsantwort")
-            return None
+
+        logger.warning("Keine gueltige Identifikationsantwort innerhalb 3s")
+        return None
 
     def _validate_checksum(self, raw: bytes) -> bool:
         if len(raw) < 4:
