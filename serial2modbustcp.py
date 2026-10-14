@@ -250,18 +250,27 @@ class D0Parser:
 
         data_baud = self.baudrate_from_ident(ident)
         use_switch = self.resolve_use_baud_switch(ident)
-        if use_switch:
+        if use_switch and data_baud != self.initial_baudrate:
+            listen_baud = data_baud
+            baud_char = self.baud_char_from_ident(ident)
             logger.info("Daten-Baudrate laut Ident: %d (Baudwechsel aktiv)", data_baud)
         else:
+            listen_baud = self.initial_baudrate
+            baud_char = "0"
             logger.info(
-                "Daten-Baudrate laut Ident: %d, lese bei %d (Baudwechsel aus)",
+                "Daten-Baudrate laut Ident: %d, ACK fordert %d Baud",
                 data_baud,
-                self.initial_baudrate,
+                listen_baud,
             )
-        # IEC 62056-21: nach ACK warten, dann ggf. Baudrate wechseln
-        time.sleep(0.3)
-        if use_switch and data_baud != self.initial_baudrate:
-            self.switch_baudrate(data_baud)
+
+        ack = self.build_ack(baud_char)
+        self.serial_conn.write(ack)
+        self.serial_conn.flush()
+        logger.debug("ACK gesendet: %r", ack)
+        # Zaehler schaltet ca. 200 ms nach ACK; erst dann die eigene Baudrate aendern.
+        time.sleep(0.2)
+        if listen_baud != self._active_baudrate:
+            self.switch_baudrate(listen_baud)
         return self.read_telegram()
 
     def identify(self) -> Optional[str]:
@@ -294,26 +303,10 @@ class D0Parser:
             logger.info("Geraet: %s", ident)
             if line != ident:
                 logger.debug("Ident normalisiert von: %s", line[:80])
-            baud_char = self.baud_char_from_ident(ident)
-            ack = self.build_ack(baud_char)
-            self.serial_conn.write(ack)
-            self.serial_conn.flush()
-            logger.debug("ACK gesendet: %r", ack)
             return ident
 
         logger.warning("Keine gueltige Identifikationsantwort innerhalb 3s")
         return None
-
-    def _validate_checksum(self, raw: bytes) -> bool:
-        if len(raw) < 4:
-            return False
-        data = raw[:-3]
-        checksum_byte = raw[-3]
-        calculated = 0
-        for b in data:
-            calculated ^= b
-        calculated &= 0x7F
-        return calculated == (checksum_byte & 0x7F)
 
     def read_telegram(self) -> Optional[str]:
         if not self.serial_conn:
@@ -349,14 +342,15 @@ class D0Parser:
             if decoded.startswith("/"):
                 continue
 
-            if not self._validate_checksum(raw):
-                logger.debug("Checksum-Fehler: %s", decoded)
+            # IEC 62056-21 hat eine BCC nur am Blockende (nach ETX), nicht pro Zeile.
+            if "(" not in decoded and not decoded.startswith("!"):
+                logger.debug("Keine Datenzeile: %s", decoded[:80])
                 continue
 
             lines.append(decoded)
 
         if not lines:
-            logger.warning("Kein Datenblock empfangen (Timeout oder nur Pruefsummenfehler)")
+            logger.warning("Kein Datenblock empfangen (Timeout)")
         return "\r\n".join(lines) if lines else None
 
     def parse_values(self, telegram: str) -> Dict[str, float]:
