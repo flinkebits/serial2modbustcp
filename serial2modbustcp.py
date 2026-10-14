@@ -46,6 +46,20 @@ STATUS_REGISTER_ERRORS = 1
 STATUS_REGISTER_LAST_READ = 2
 STATUS_REGISTER_VERSION = 3
 
+# IEC 62056-21 Baudraten-Kennung (Zeichen nach Herstellerkennung in der Ident-Zeile)
+IEC62056_BAUD_RATES = {
+    "0": 300,
+    "1": 600,
+    "2": 1200,
+    "3": 2400,
+    "4": 4800,
+    "5": 9600,
+    "6": 19200,
+    "7": 9600,
+    "8": 57600,
+    "9": 115200,
+}
+
 
 class Config:
     """Laden und Validieren der Konfiguration."""
@@ -100,6 +114,7 @@ class D0Parser:
         self.port = port
         self.initial_baudrate = initial_baudrate
         self.serial_conn: Optional[serial.Serial] = None
+        self._active_baudrate = initial_baudrate
 
     def connect(self) -> None:
         self.serial_conn = serial.Serial(
@@ -110,6 +125,7 @@ class D0Parser:
             stopbits=serial.STOPBITS_ONE,
             timeout=2,
         )
+        self._active_baudrate = self.initial_baudrate
         logger.info("Verbunden mit %s @ %d baud", self.port, self.initial_baudrate)
 
     def disconnect(self) -> None:
@@ -124,6 +140,8 @@ class D0Parser:
     def switch_baudrate(self, baudrate: int) -> None:
         if not self.serial_conn:
             return
+        if self._active_baudrate == baudrate:
+            return
         self.serial_conn.close()
         time.sleep(0.1)
         self.serial_conn = serial.Serial(
@@ -134,7 +152,53 @@ class D0Parser:
             stopbits=serial.STOPBITS_ONE,
             timeout=2,
         )
+        self._active_baudrate = baudrate
         logger.info("Baudrate gewechselt zu %d", baudrate)
+
+    @staticmethod
+    def baudrate_from_ident(ident: str) -> int:
+        """Baudrate aus Ident-Zeile, z. B. /LGZ5\\2... -> 9600."""
+        slash = ident.find("/")
+        if slash < 0:
+            return 300
+        after = ident[slash + 1 :]
+        if len(after) < 4:
+            return 300
+        baud_char = after[3]
+        rate = IEC62056_BAUD_RATES.get(baud_char)
+        if rate is None:
+            logger.warning("Unbekannte Baud-Kennung '%s' in Ident, verwende 300", baud_char)
+            return 300
+        return rate
+
+    @staticmethod
+    def normalize_obis_code(obis_code: str) -> str:
+        """OBIS vereinheitlichen: Speicher *255 entfernen, Kurzform 1.8.0 -> 1-0:1.8.0."""
+        if "*" in obis_code:
+            obis_code = obis_code.split("*", 1)[0]
+        if "-" not in obis_code and obis_code.count(".") >= 2:
+            obis_code = f"1-0:{obis_code}"
+        return obis_code
+
+    def read_cycle(self) -> Optional[str]:
+        """Vollstaendiger D0-Lesezyklus: IDENT @ 300, ACK, Baudwechsel, Telegramm."""
+        if not self.serial_conn:
+            return None
+
+        if self._active_baudrate != self.initial_baudrate:
+            self.switch_baudrate(self.initial_baudrate)
+
+        ident = self.identify()
+        if not ident:
+            return None
+
+        data_baud = self.baudrate_from_ident(ident)
+        logger.info("Daten-Baudrate laut Ident: %d", data_baud)
+        if data_baud != self.initial_baudrate:
+            time.sleep(0.05)
+            self.switch_baudrate(data_baud)
+        self.serial_conn.reset_input_buffer()
+        return self.read_telegram()
 
     def identify(self) -> Optional[str]:
         if not self.serial_conn:
@@ -210,7 +274,7 @@ class D0Parser:
                 continue
             try:
                 obis_end = line.index("(")
-                obis_code = line[:obis_end]
+                obis_code = self.normalize_obis_code(line[:obis_end])
                 value_end = line.index(")", obis_end + 1)
                 value_str = line[obis_end + 1 : value_end]
                 if "*" in value_str:
@@ -294,9 +358,6 @@ class Gateway:
 
         try:
             self.d0.connect()
-            ident = self.d0.identify()
-            if not ident:
-                logger.warning("Identifikation fehlgeschlagen - lese trotzdem weiter")
         except Exception as e:
             logger.error("Verbindung fehlgeschlagen: %s", e)
 
@@ -309,7 +370,7 @@ class Gateway:
 
         while self._running:
             try:
-                telegram = self.d0.read_telegram()
+                telegram = self.d0.read_cycle()
                 if telegram:
                     values = self.d0.parse_values(telegram)
                     for obis_code, value in values.items():
